@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { bootstrapCompanies, searchLiveAres } from '../src/services/companyBootstrap';
 import type { Company } from '../src/types/company';
 
@@ -10,6 +10,9 @@ const currency = new Intl.NumberFormat('cs-CZ', {
   maximumFractionDigits: 0,
 });
 const PAGE_SIZE = 20;
+const subscribeToNothing = () => () => {};
+const getClientSnapshot = () => true;
+const getServerSnapshot = () => false;
 const TURNOVER_FILTERS = [
   { value: 'all', label: 'Všechny obraty' },
   { value: 'under-5m', label: 'Do 5 mil. Kč' },
@@ -27,6 +30,25 @@ function companyAddress(company: Company): string {
 }
 
 function CompanyDetails({ company, onClose }: { company: Company; onClose: () => void }) {
+  const [loadedManagement, setLoadedManagement] = useState<{ ico: string; contacts: Company['management'] } | null>(null);
+
+  useEffect(() => {
+    if (company.source !== 'local' && company.management.length) return;
+
+    const controller = new AbortController();
+    searchLiveAres(company.ico, controller.signal)
+      .then((results) => {
+        const refreshedCompany = results?.find((result) => result.ico === company.ico);
+        if (refreshedCompany) setLoadedManagement({ ico: company.ico, contacts: refreshedCompany.management });
+      })
+
+    return () => controller.abort();
+  }, [company.ico, company.management, company.source]);
+
+  const hasAresManagement = loadedManagement?.ico === company.ico && loadedManagement.contacts.length > 0;
+  const management = hasAresManagement ? loadedManagement.contacts : company.management;
+  const managementFromAres = hasAresManagement || (company.source === 'ares-live' && company.management.length > 0);
+
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') onClose();
@@ -54,20 +76,26 @@ function CompanyDetails({ company, onClose }: { company: Company; onClose: () =>
             <span className="detail-label">Sídlo</span>
             <p>{companyAddress(company)}</p>
             <span className="detail-label detail-label-spaced">Obrat</span>
-            <p>{company.turnoverCzk == null ? 'Turnover: N/A in ARES' : currency.format(company.turnoverCzk)}</p>
+            <p>{company.turnoverCzk == null ? 'Obrat není v ARES k dispozici' : currency.format(company.turnoverCzk)}</p>
           </div>
 
           <div className="detail-block">
             <span className="detail-label">Vedení a kontakty</span>
-            {company.management.length ? company.management.map((contact, index) => (
+            {management.length ? management.map((contact, index) => (
               <div className="contact" key={`${contact.name}-${index}`}>
                 <strong>{contact.name}</strong>
                 <span>{contact.role}</span>
                 {contact.email && <a href={`mailto:${contact.email}`}>{contact.email}</a>}
                 {contact.phone && <a href={`tel:${contact.phone.replaceAll(' ', '')}`}>{contact.phone}</a>}
               </div>
-            )) : <p className="muted">Direct contact: Not publicly available</p>}
-            {company.source === 'local' && <p className="demo-note">Ukázkové kontakty a obrat jsou ilustrační údaje.</p>}
+            )) : <p className="muted">Údaje o vedení nejsou v registru dostupné.</p>}
+            {(company.source === 'local' || managementFromAres) && (
+              <p className="demo-note">
+                {managementFromAres
+                  ? `Jména a funkce pocházejí z ARES; e-mail a telefon jsou ilustrační.${company.source === 'local' ? ' Obrat je také ilustrační.' : ''}`
+                  : 'Kontakty a obrat jsou ilustrační údaje.'}
+              </p>
+            )}
           </div>
         </div>
 
@@ -87,7 +115,6 @@ function CompanyDetails({ company, onClose }: { company: Company; onClose: () =>
 export default function Home() {
   const [companies, setCompanies] = useState<Company[]>([]);
   const [selectedCompany, setSelectedCompany] = useState<Company | null>(null);
-  const [mounted, setMounted] = useState(false);
   const [loading, setLoading] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
   const [searchQuery, setSearchQuery] = useState('');
@@ -97,6 +124,7 @@ export default function Home() {
   const [liveSearchLoading, setLiveSearchLoading] = useState(false);
   const [selectedLocation, setSelectedLocation] = useState('all');
   const [selectedTurnover, setSelectedTurnover] = useState<(typeof TURNOVER_FILTERS)[number]['value']>('all');
+  const mounted = useSyncExternalStore(subscribeToNothing, getClientSnapshot, getServerSnapshot);
 
   const locations = Array.from(new Set(companies.map((company) => company.address.region || company.address.city).filter(Boolean)))
     .sort((a, b) => a.localeCompare(b, 'cs'));
@@ -129,6 +157,10 @@ export default function Home() {
   function updateSearch(value: string) {
     setSearchQuery(value);
     setCurrentPage(1);
+    setLiveCompanies([]);
+    setLiveSearchQuery('');
+    setLiveNotFoundQuery('');
+    setLiveSearchLoading(false);
   }
 
   function updateLocation(value: string) {
@@ -143,7 +175,6 @@ export default function Home() {
 
   useEffect(() => {
     let active = true;
-    setMounted(true);
     bootstrapCompanies()
       .then((data) => { if (active) setCompanies(data); })
       .finally(() => { if (active) setLoading(false); });
@@ -153,10 +184,6 @@ export default function Home() {
   useEffect(() => {
     let active = true;
     const query = searchQuery.trim();
-    setLiveCompanies([]);
-    setLiveSearchQuery('');
-    setLiveNotFoundQuery('');
-    setLiveSearchLoading(false);
 
     if (!mounted || loading || filteredCompanies.length > 0 || !/^\d{1,8}$/.test(query.replace(/\s/g, ''))) return;
 
@@ -187,8 +214,7 @@ export default function Home() {
   }, [filteredCompanies.length, isIcoQuery, loading, mounted, searchQuery]);
 
   function clearSearch() {
-    setSearchQuery('');
-    setCurrentPage(1);
+    updateSearch('');
   }
 
   return (
@@ -212,7 +238,7 @@ export default function Home() {
           <div className="table-toolbar">
             <div><h2>Společnosti</h2><p>Základní údaje z veřejného rejstříku</p></div>
             {!isLoading && <div className="toolbar-meta">
-              {showingLiveResults && <span className="live-badge"><span className="live-dot" />Live data from ARES</span>}
+              {showingLiveResults && <span className="live-badge"><span className="live-dot" />Aktuální data z ARES</span>}
               <span className="result-count">{displayCompanies.length} záznamů</span>
               {searchQuery && <button type="button" className="clear-search ml-auto cursor-pointer whitespace-nowrap rounded-md bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-200 hover:text-gray-900" onClick={clearSearch}>Clear search</button>}
             </div>}
@@ -255,9 +281,9 @@ export default function Home() {
           ) : companies.length === 0 ? (
             <div className="table-state">Data se nepodařilo načíst. Obnovte stránku a zkuste to znovu.</div>
           ) : shouldUseLiveSearch && liveSearchLoading ? (
-            <div className="table-state"><span className="loader" />Searching ARES…</div>
+            <div className="table-state"><span className="loader" />Vyhledávám v ARES…</div>
           ) : displayCompanies.length === 0 ? (
-            <div className="table-state">{liveEntityNotFound ? 'Entity not found in ARES.' : 'Pro zadané hledání a filtry jsme nic nenašli.'}</div>
+            <div className="table-state">{liveEntityNotFound ? 'Subjekt nebyl v ARES nalezen.' : 'Pro zadané hledání a filtry jsme nic nenašli.'}</div>
           ) : (
             <div className="table-scroll">
               <table>
@@ -267,14 +293,14 @@ export default function Home() {
                     <td className="company-name">{company.name}</td>
                     <td className="ico-cell">{company.ico}</td>
                     <td className="address-cell">{companyAddress(company)}</td>
-                    <td className="turnover-cell">{company.turnoverCzk == null ? <span className="na-value">{company.source === 'ares-live' ? 'N/A in ARES' : 'Nedostupný'}</span> : currency.format(company.turnoverCzk)}</td>
+                    <td className="turnover-cell">{company.turnoverCzk == null ? <span className="na-value">{company.source === 'ares-live' ? 'V ARES není uveden' : 'Nedostupný'}</span> : currency.format(company.turnoverCzk)}</td>
                     <td className="action-cell"><button type="button" className="details-button" onClick={() => setSelectedCompany(company)}>Detail <span aria-hidden="true">→</span></button></td>
                   </tr>
                 ))}</tbody>
               </table>
             </div>
           )}
-          <div className="table-footnote">{showingLiveResults ? 'Live data from the ARES public registry. Turnover and direct contacts are not available.' : 'Obrat a kontakty vedení jsou u lokálního datasetu ukázkové údaje.'}</div>
+          <div className="table-footnote">{showingLiveResults ? 'Aktuální údaje z veřejného rejstříku ARES. Obrat a přímé kontakty nejsou v registru dostupné.' : 'Obrat a kontakty vedení jsou u lokálního datasetu ukázkové údaje.'}</div>
         </section>
         {!isLoading && pageCount > 1 && (
           <nav className="pagination flex items-center justify-center gap-4 py-5" aria-label="Stránkování seznamu společností">
